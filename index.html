@@ -134,7 +134,7 @@
 
         .hidden { display: none !important; }
         
-        /* STYLE BARU UNTUK CUSTOM ALERT (TOAST) */
+        /* STYLE UNTUK CUSTOM ALERT (TOAST) */
         #custom-alert {
             position: fixed;
             top: 20px; left: 50%; transform: translateX(-50%);
@@ -239,40 +239,105 @@
     let timerInterval;
     let currentUser = {};
     let currentMapel = "";
-    let wakeLock = null;
+    let wakeLock = null; // Variable untuk Wake Lock
+    
+    // --- VARIABEL KEAMANAN ---
     let isExamActive = false; 
 
-    // --- FUNGSI UTAMA: GENERATE KUNCI PENYIMPANAN ---
-    // Kunci ini unik berdasarkan ID Siswa & Mapel, supaya tidak tertukar
+    // --- FUNGSI LOCAL STORAGE (FITUR SAVE JAWABAN) ---
     function getStorageKey() {
-        return "CBT_JAWABAN_" + currentUser.id + "_" + currentMapel;
+        // Membuat kunci unik berdasarkan ID Siswa dan Mata Pelajaran
+        return `krisba_cbt_${currentUser.id}_${currentMapel}`;
+    }
+
+    function saveProgress() {
+        if(!isExamActive) return;
+        const key = getStorageKey();
+        const data = {
+            answers: userAnswers,
+            timers: timers, // Menyimpan sisa waktu per soal
+            lastIdx: currentIdx,
+            timestamp: Date.now()
+        };
+        localStorage.setItem(key, JSON.stringify(data));
+    }
+
+    function loadProgress() {
+        const key = getStorageKey();
+        const raw = localStorage.getItem(key);
+        if(raw) {
+            try {
+                const data = JSON.parse(raw);
+                userAnswers = data.answers || {};
+                
+                // Restore Timer hanya jika data valid
+                if(data.timers) {
+                    // Kita merge timer: update timer yang sudah jalan saja
+                    for(let k in data.timers) {
+                        timers[k] = data.timers[k];
+                    }
+                }
+                
+                // Kembalikan ke nomor soal terakhir jika ada, kalau tidak mulai dari 0
+                // Opsional: Anda bisa memaksa mulai dari 0 agar siswa cek ulang
+                // currentIdx = data.lastIdx || 0; 
+                return true;
+            } catch(e) {
+                console.error("Gagal load progress", e);
+                return false;
+            }
+        }
+        return false;
+    }
+
+    function clearProgress() {
+        const key = getStorageKey();
+        localStorage.removeItem(key);
+    }
+
+    // --- FUNGSI WAKE LOCK (LAYAR TETAP NYALA) ---
+    async function requestWakeLock() {
+        try {
+            if ('wakeLock' in navigator) {
+                wakeLock = await navigator.wakeLock.request('screen');
+                console.log('Screen Wake Lock active');
+                wakeLock.addEventListener('release', () => {
+                    console.log('Screen Wake Lock released');
+                    // Coba request ulang jika lepas (misal user switch tab sebentar)
+                    if(isExamActive) requestWakeLock(); 
+                });
+            }
+        } catch (err) {
+            console.error(`${err.name}, ${err.message}`);
+        }
     }
 
     window.onload = function() {
         console.log("Menghubungi server...");
+        const loadingText = document.getElementById('loading-text');
         
-        // Re-enable wake lock jika tab kembali aktif
-        document.addEventListener('visibilitychange', async () => {
-            if (wakeLock !== null && document.visibilityState === 'visible') {
-                try { wakeLock = await navigator.wakeLock.request('screen'); } catch(e){}
-            }
-        });
-
         fetch(SCRIPT_URL + "?action=getDataSiswa")
-            .then(res => res.text())
+            .then(res => {
+                if (!res.ok) throw new Error("HTTP Error: " + res.status);
+                return res.text();
+            })
             .then(text => {
+                text = text.trim();
                 try {
                     const data = JSON.parse(text);
                     if (data.error) throw new Error(data.error);
+                    if (!Array.isArray(data)) throw new Error("Format data salah!");
                     allSiswaData = data;
                     populateKelas();
                     document.getElementById('loading-overlay').style.display = 'none'; 
                     document.getElementById('login-form').classList.remove('hidden');
                 } catch (e) {
-                    alert("Gagal Membaca Data Server: " + e.message);
+                    alert("Gagal Membaca Data Server:\n" + e.message);
                 }
             })
-            .catch(err => alert("Gagal Koneksi: " + err.message));
+            .catch(err => {
+                alert("Gagal Koneksi: " + err.message);
+            });
     };
 
     function populateKelas() {
@@ -344,13 +409,14 @@
                 return res.arrayBuffer();
             })
             .then(ab => {
+                document.getElementById('login-msg').innerText = "Membaca File...";
                 const wb = XLSX.read(ab, {type: 'array'});
                 const ws = wb.Sheets[wb.SheetNames[0]];
                 const json = XLSX.utils.sheet_to_json(ws);
                 processExcelData(json);
             })
             .catch(err => {
-                alert("Gagal Memuat Soal: " + err.message);
+                alert("Gagal Memuat Soal:\n" + err.message);
                 document.querySelector('.btn').disabled = false;
             });
     }
@@ -373,9 +439,14 @@
         });
 
         if(currentSoalData.length > 0) {
+            // --- LOAD PROGRESS JIKA ADA (Jawaban & Timer) ---
+            const hasSavedData = loadProgress();
+            if (hasSavedData) {
+                console.log("Data tersimpan ditemukan dan dimuat.");
+            }
             startQuiz();
         } else {
-            alert("Tidak ada soal ditemukan.");
+            alert("Tidak ada soal yang ditemukan (Cek Header Excel).");
             document.querySelector('.btn').disabled = false;
         }
     }
@@ -383,39 +454,22 @@
     function showWarning() {
         const toast = document.getElementById('custom-alert');
         toast.classList.add('show');
-        setTimeout(() => { toast.classList.remove('show'); }, 2000);
+        setTimeout(() => {
+            toast.classList.remove('show');
+        }, 2000);
     }
 
-    async function startQuiz() {
+    function startQuiz() {
         isExamActive = true; 
         
-        // --- RESTORE JAWABAN (FITUR BARU) ---
-        // Cek apakah ada jawaban tersimpan di HP siswa
-        const savedAnswers = localStorage.getItem(getStorageKey());
-        if (savedAnswers) {
-            try {
-                userAnswers = JSON.parse(savedAnswers);
-                console.log("Jawaban sebelumnya berhasil dipulihkan.");
-            } catch(e) {
-                console.log("Gagal memulihkan jawaban.");
-            }
-        } else {
-            userAnswers = {}; // Reset jika tidak ada save
-        }
-        // ------------------------------------
+        // Aktifkan Wake Lock agar layar tidak mati
+        requestWakeLock();
 
         document.getElementById('login-page').classList.add('hidden');
         document.getElementById('quiz-page').classList.remove('hidden');
         document.getElementById('student-info').innerText = currentUser.nama;
-        
-        try {
-            if ('wakeLock' in navigator) {
-                wakeLock = await navigator.wakeLock.request('screen');
-            }
-        } catch (err) {}
-
         renderNavGrid();
-        showQuestion(0);
+        showQuestion(currentIdx); // Mulai dari currentIdx (bisa 0 atau yg tersimpan)
         openFullscreen();
     }
     
@@ -423,6 +477,7 @@
         const elem = document.documentElement;
         if (elem.requestFullscreen) { elem.requestFullscreen(); }
         else if (elem.webkitRequestFullscreen) { elem.webkitRequestFullscreen(); } 
+        else if (elem.msRequestFullscreen) { elem.msRequestFullscreen(); }
     }
 
     function showQuestion(idx) {
@@ -445,10 +500,10 @@
         optCont.innerHTML = "";
         const labels = ['A', 'B', 'C', 'D'];
         
+        // Cek apakah waktu sudah habis (bisa jadi dari loadProgress bernilai 0)
         const isLocked = timers[idx] <= 0;
 
         data.opsi.forEach((val, i) => {
-            // Cek apakah userAnswers memiliki data untuk soal ini
             let checked = userAnswers[idx] == labels[i] ? "checked" : "";
             let disabledAttr = isLocked ? "disabled" : "";
             let lockedClass = isLocked ? "locked-opt" : "";
@@ -491,13 +546,20 @@
             if(timers[idx] > 0) { 
                 timers[idx]--; 
                 update(); 
-                updateNavButtonsState(); 
+                updateNavButtonsState();
+                
+                // Simpan progress timer setiap 5 detik agar tidak memberatkan browser,
+                // tapi cukup sering untuk menyimpan sisa waktu jika di-refresh.
+                if(timers[idx] % 5 === 0) saveProgress();
+
             } else { 
                 clearInterval(timerInterval); 
                 display.innerText = "HABIS"; 
                 display.style.color = '#e74c3c';
+                
                 lockCurrentQuestionUI(); 
-                updateNavButtonsState(); 
+                updateNavButtonsState();
+                saveProgress(); // Simpan state locked
             }
         }, 1000);
     }
@@ -517,33 +579,36 @@
         if (isTimerRunning) {
             btnNext.classList.add('btn-locked');
             btnPrev.classList.add('btn-locked');
-            document.querySelectorAll('.nav-item').forEach(item => item.classList.add('locked-nav'));
+            const gridItems = document.querySelectorAll('.nav-item');
+            gridItems.forEach(item => item.classList.add('locked-nav'));
         } else {
             btnNext.classList.remove('btn-locked');
             btnPrev.classList.remove('btn-locked');
-            document.querySelectorAll('.nav-item').forEach(item => item.classList.remove('locked-nav'));
+            const gridItems = document.querySelectorAll('.nav-item');
+            gridItems.forEach(item => item.classList.remove('locked-nav'));
         }
     }
 
     function saveAnswer(val) { 
         if(timers[currentIdx] <= 0) return;
         userAnswers[currentIdx] = val; 
-        
-        // --- AUTO SAVE KE LOCAL STORAGE ---
-        // Setiap kali klik, simpan ke memori HP
-        localStorage.setItem(getStorageKey(), JSON.stringify(userAnswers));
-        // ----------------------------------
-
         updateNavGrid(); 
+        saveProgress(); // Simpan jawaban ke LocalStorage
     }
     
     function nextQuestion() { 
-        if (timers[currentIdx] > 0) { showWarning(); return; }
+        if (timers[currentIdx] > 0) {
+            showWarning(); 
+            return;
+        }
         if(currentIdx < currentSoalData.length - 1) showQuestion(currentIdx + 1); 
     }
 
     function prevQuestion() { 
-        if (timers[currentIdx] > 0) { showWarning(); return; }
+        if (timers[currentIdx] > 0) {
+            showWarning(); 
+            return;
+        }
         if(currentIdx > 0) showQuestion(currentIdx - 1); 
     }
 
@@ -557,7 +622,10 @@
             btn.id = 'nav-' + i;
             
             btn.onclick = () => {
-                if (timers[currentIdx] > 0 && currentIdx !== i) { showWarning(); return; }
+                if (timers[currentIdx] > 0 && currentIdx !== i) {
+                     showWarning(); 
+                     return;
+                }
                 showQuestion(i);
             };
             grid.appendChild(btn);
@@ -570,7 +638,7 @@
             if(el) {
                 el.className = 'nav-item'; 
                 if(i === currentIdx) el.classList.add('active');
-                if(userAnswers[i]) el.classList.add('answered'); // Ini akan otomatis hijau jika ada save-an
+                if(userAnswers[i]) el.classList.add('answered');
                 
                 if (timers[currentIdx] > 0 && currentIdx !== i) {
                     el.classList.add('locked-nav');
@@ -593,7 +661,6 @@
         if(!confirm(confirmMsg)) return;
 
         isExamActive = false; 
-        if (wakeLock !== null) { wakeLock.release().then(() => { wakeLock = null; }); }
         
         clearInterval(timerInterval);
         const btn = document.querySelector('.btn-danger');
@@ -619,10 +686,7 @@
         .then(res => res.json())
         .then(resp => {
             if(resp.result === "success") {
-                 // --- HAPUS SAVE-AN JIKA SUKSES ---
-                 localStorage.removeItem(getStorageKey());
-                 // ---------------------------------
-                 
+                 clearProgress(); // Hapus data simpanan jika sukses terkirim
                  alert("=== UJIAN SELESAI ===\n\nNama: " + currentUser.nama + "\nNilai Anda: " + nilai.toFixed(2));
                  location.reload(); 
             } else {
@@ -635,14 +699,43 @@
         });
     }
 
-    // --- KEAMANAN DASAR ---
+    // ==========================================
+    // LOGIKA KEAMANAN ANTI-CURANG
+    // ==========================================
+    
     function forceKick(reason) {
         if (!isExamActive) return;
+        
+        // Hapus data simpanan agar siswa tidak bisa melanjutkan sisa waktunya?
+        // Untuk saat ini dibiarkan (tidak dihapus), karena siswa mungkin tidak sengaja.
+        // Jika ingin hukuman keras (hapus jawaban), aktifkan baris di bawah:
+        // clearProgress(); 
+
         isExamActive = false; 
         clearInterval(timerInterval);
-        alert("PELANGGARAN TERDETEKSI!\n\n" + reason);
+        
+        alert("PELANGGARAN TERDETEKSI!\n\n" + reason + "\n\nSistem otomatis menghentikan ujian. Anda akan dikembalikan ke halaman login.");
         location.reload(); 
     }
+
+    document.addEventListener("visibilitychange", function() {
+        if (document.hidden && isExamActive) {
+            forceKick("Anda terdeteksi meninggalkan halaman ujian (pindah tab/minimize).");
+        } else if (!document.hidden && isExamActive) {
+            requestWakeLock(); // Request ulang lock jika kembali
+        }
+    });
+
+    window.addEventListener("blur", function() {
+        if (isExamActive) {
+            setTimeout(() => {
+                if (document.activeElement === document.body) { 
+                   // Check
+                }
+                forceKick("Anda terdeteksi beralih ke aplikasi lain.");
+            }, 200);
+        }
+    });
 
     document.addEventListener("keyup", function(e) {
         if (isExamActive) {
